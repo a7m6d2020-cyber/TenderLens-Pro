@@ -39,9 +39,12 @@ log = logging.getLogger("TenderLens")
 # ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
-DEFAULT_MODEL = "gpt-4o"
-FALLBACK_MODEL = "gpt-4o-mini"
-AVAILABLE_MODELS = ["gpt-4o", "gpt-4o-mini", "gpt-4-turbo", "gpt-4.1", "gpt-4.1-mini"]
+# GPT-5.5 Extended configuration
+# ملاحظة: لا يوجد Model ID مستقل باسم "extended"؛ يتم تفعيل التحليل الموسّع عبر reasoning effort = xhigh.
+DEFAULT_MODEL = "gpt-5.5"
+FALLBACK_MODEL = "gpt-5.4-mini"
+AVAILABLE_MODELS = ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-4o", "gpt-4o-mini"]
+DEFAULT_REASONING_EFFORT = "xhigh"
 MAX_FILE_SIZE_MB = 50
 MAX_TOKENS_PER_REQ = 8192
 API_TIMEOUT = 120.0
@@ -236,22 +239,23 @@ def get_client():
 
 
 def test_api_connection() -> tuple[bool, str]:
-    """اختبار سريع لصحة المفتاح والاتصال."""
+    """اختبار سريع لصحة المفتاح والاتصال باستخدام نفس مسار الاستدعاء المعتمد."""
     client = get_openai_client()
     if not client:
         return False, "لم يتم تكوين عميل OpenAI. تحقق من المفتاح أو من إعدادات Streamlit Secrets."
     try:
-        resp = client.chat.completions.create(
-            model=st.session_state.get("openai_model", DEFAULT_MODEL),
-            messages=[{"role": "user", "content": "Reply with OK only."}],
-            max_tokens=20,
+        model_name = st.session_state.get("openai_model", DEFAULT_MODEL)
+        content = call_ai(
+            client,
+            "You are a connectivity test. Reply with OK only.",
+            "Reply with OK only.",
+            model=model_name,
+            max_tokens=40,
             temperature=0,
-            timeout=30.0,
         )
-        content = (resp.choices[0].message.content or "").strip()
-        if not content:
-            return False, "تم الاتصال لكن الاستجابة فارغة. جرّب نموذجاً أخف مثل gpt-4o-mini."
-        return True, f"✅ الاتصال ناجح ({resp.model}) — {content[:40]}"
+        if not content or content.startswith("[AI Error") or content.startswith("[AI Auth"):
+            return False, content or "تم الاتصال لكن الاستجابة فارغة."
+        return True, f"✅ الاتصال ناجح ({model_name}) — {content[:40]}"
     except AuthenticationError:
         return False, "❌ المفتاح غير صالح أو لا يملك صلاحية."
     except APITimeoutError:
@@ -267,6 +271,53 @@ def test_api_connection() -> tuple[bool, str]:
 # ─────────────────────────────────────────────────────────────────────────────
 # AI CALLS — UNIFIED & HARDENED
 # ─────────────────────────────────────────────────────────────────────────────
+def _is_responses_model(model: str) -> bool:
+    """النماذج الحديثة GPT-5.x تعمل عبر Responses API لضمان دعم reasoning effort."""
+    return str(model or "").startswith("gpt-5")
+
+
+def _extract_responses_text(resp) -> str:
+    """استخراج النص من Responses API مع دعم عدة أشكال للإخراج."""
+    output_text = getattr(resp, "output_text", None)
+    if output_text:
+        return str(output_text).strip()
+
+    parts = []
+    for item in getattr(resp, "output", []) or []:
+        for content in getattr(item, "content", []) or []:
+            txt = getattr(content, "text", None)
+            if txt:
+                parts.append(str(txt))
+    return "\n".join(parts).strip()
+
+
+def _call_responses_api(client, system: str, user: str, model: str, max_tokens: int) -> str:
+    """استدعاء Responses API مع GPT-5.5 Extended reasoning."""
+    # OpenAI يستخدم Model ID = gpt-5.5، أما مفهوم Extended هنا فيُطبّق عبر reasoning effort = xhigh.
+    resp = client.responses.create(
+        model=model,
+        instructions=system,
+        input=user,
+        reasoning={"effort": DEFAULT_REASONING_EFFORT},
+        max_output_tokens=max_tokens,
+    )
+    return _extract_responses_text(resp)
+
+
+def _call_chat_completions_api(client, system: str, user: str, model: str, temperature: float, max_tokens: int) -> str:
+    """استدعاء Chat Completions للنماذج القديمة/الاحتياطية فقط."""
+    resp = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        temperature=temperature,
+        max_tokens=max_tokens,
+    )
+    return (resp.choices[0].message.content or "").strip()
+
+
 def call_ai(
     client,
     system: str,
@@ -277,6 +328,7 @@ def call_ai(
 ) -> str:
     """
     استدعاء AI موحَّد مع معالجة شاملة للأخطاء وإعادة المحاولة.
+    يعتمد GPT-5.5 كخيار افتراضي عبر Responses API مع reasoning effort = xhigh.
     """
     if client is None:
         return "[AI Error: لا يوجد عميل OpenAI. أدخل مفتاح API في الشريط الجانبي.]"
@@ -286,19 +338,22 @@ def call_ai(
     last_err = None
     for attempt in range(API_MAX_RETRIES):
         try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            return (resp.choices[0].message.content or "").strip()
+            if _is_responses_model(model) and hasattr(client, "responses"):
+                content = _call_responses_api(client, system, user, model, max_tokens)
+            else:
+                content = _call_chat_completions_api(client, system, user, model, temperature, max_tokens)
+
+            if not content:
+                return "[AI Error: تم الاتصال بالنموذج لكن الاستجابة النصية فارغة.]"
+            return content
 
         except RateLimitError as e:
             last_err = e
+            if is_request_too_large_error(str(e)):
+                return (
+                    "[AI Error: الطلب أكبر من حدود نموذج/حساب OpenAI الحالي. "
+                    "تم منع إعادة المحاولة غير المفيدة. الحل: استخدم التحليل المرحلي أو قلل عدد/حجم الملفات.]"
+                )
             wait = 2 ** attempt
             log.warning(f"Rate limit hit, waiting {wait}s")
             time.sleep(wait)
@@ -312,7 +367,8 @@ def call_ai(
 
         except APIError as e:
             last_err = e
-            if "model" in str(e).lower() and attempt == 0:
+            msg = str(e).lower()
+            if ("model" in msg or "unsupported" in msg or "not found" in msg) and attempt == 0:
                 model = FALLBACK_MODEL
                 log.warning(f"Falling back to {FALLBACK_MODEL}")
                 continue
@@ -320,6 +376,11 @@ def call_ai(
 
         except Exception as e:
             last_err = e
+            msg = str(e).lower()
+            if ("responses" in msg or "unexpected keyword" in msg or "model" in msg) and attempt == 0:
+                model = FALLBACK_MODEL
+                log.warning(f"Falling back to {FALLBACK_MODEL} after unexpected error: {e}")
+                continue
             log.error(f"Unexpected AI error: {e}")
             break
 
@@ -360,6 +421,113 @@ def call_ai_json(client, system: str, user: str, **kwargs) -> dict | list:
                 except json.JSONDecodeError:
                     continue
     return {}
+
+
+def is_request_too_large_error(text: str) -> bool:
+    """كشف خطأ OpenAI الخاص بكبر حجم الطلب حتى لا نعيد المحاولة بلا فائدة."""
+    t = (text or "").lower()
+    return "request too large" in t or "tokens per min" in t or "maximum context" in t
+
+
+def build_compact_context_from_file(name: str, txt: str, max_chars: int = 18000) -> str:
+    """تجهيز سياق محدود وآمن لكل ملف بدلاً من إرسال كل النص الخام دفعة واحدة."""
+    cleaned = re.sub(r"\n{3,}", "\n\n", txt or "")
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    return f"\n\n{'='*50}\nالملف: {name}\n{'='*50}\n{safe_truncate(cleaned, max_chars)}"
+
+
+SINGLE_FILE_TENDER_PROMPT = """أنت مهندس مكتب فني أول وخبير تحليل وثائق مناقصات.
+
+مهمتك الآن تحليل ملف واحد فقط من ملفات المناقصة، وليس إصدار التقرير النهائي.
+استخرج الحقائق القابلة للاستخدام لاحقاً في التقرير النهائي، مع المحافظة على اسم الملف كمصدر.
+
+أعد مخرجاً مركزاً ومنظماً، ولا يتجاوز 900 كلمة، بالهيكل التالي:
+# مصدر الملف
+# معلومات المشروع المذكورة
+# نطاق الأعمال
+# المتطلبات الفنية والرقمية
+# المدد والمواعيد والضمانات
+# الشروط التعاقدية والمالية المهمة
+# متطلبات التقديم والامتثال
+# المخاطر والفجوات
+# معلومات غير متوفرة داخل هذا الملف
+
+لا تخترع أي معلومة. إذا لم تظهر المعلومة في الملف، اكتب: غير متوفرة في هذا الملف."""
+
+
+TENDER_SYNTHESIS_PROMPT = """أنت مهندس مكتب فني أول وخبير عطاءات دولية متخصص في مشاريع البنية التحتية والتشييد.
+
+مهمتك دمج ملخصات تحليل ملفات المناقصة في تقرير استخلاصي نهائي.
+اعتمد فقط على الملخصات المزودة لك، ولا تخترع أي معلومة.
+عند غياب المعلومة اكتب: غير محددة في الوثائق المرفوعة.
+
+هيكل التقرير المطلوب:
+# 📋 ملخص تنفيذي
+# 1. نطاق العمل والأعمال المطلوبة
+# 2. مدة المشروع والمراحل الزمنية
+# 3. المتطلبات الفنية والكودية
+# 4. جداول الكميات والأرقام والكميات المهمة
+# 5. الشروط التعاقدية والمخاطر
+# 6. متطلبات التقديم والامتثال
+# 7. الفجوات والمعلومات غير المتوفرة
+# 8. توصيات فنية لفريق العروض
+
+اذكر مصدر كل معلومة قدر الإمكان باسم الملف كما ورد في الملخصات."""
+
+
+def analyze_tender_in_batches(client, tender_texts: dict) -> str:
+    """
+    تحليل مناقصة كبيرة بطريقة Map-Reduce:
+    1) تحليل كل ملف منفرداً ضمن حد آمن.
+    2) ضغط مخرجات الملفات.
+    3) إصدار تقرير نهائي من الملخصات فقط.
+    هذا يمنع خطأ Request too large حتى مع النماذج ذات السياق الكبير.
+    """
+    if not tender_texts:
+        return "[AI Error: لا توجد ملفات لتحليلها.]"
+
+    per_file_summaries = []
+    total = len(tender_texts)
+
+    for i, (name, txt) in enumerate(tender_texts.items(), start=1):
+        file_context = build_compact_context_from_file(name, txt, max_chars=18000)
+        file_prompt = (
+            f"حلل الملف رقم {i} من {total}.\n"
+            f"اسم الملف: {name}\n"
+            f"عدد الكلمات التقريبي: {word_count(txt):,}\n\n"
+            f"النص المحدود الآمن للتحليل:\n{file_context}"
+        )
+        summary = call_ai(
+            client,
+            SINGLE_FILE_TENDER_PROMPT,
+            file_prompt,
+            max_tokens=3000,
+            temperature=0.1,
+        )
+        if summary.startswith("[AI Error"):
+            per_file_summaries.append(f"# {name}\nتعذر تحليل هذا الملف: {summary}")
+        else:
+            per_file_summaries.append(f"# {name}\n{safe_truncate(summary, 6000)}")
+
+        # تهدئة بسيطة لتقليل ضغط rate limit على الحسابات الصغيرة
+        time.sleep(0.8)
+
+    merged_summaries = "\n\n".join(per_file_summaries)
+
+    final_input = (
+        "فيما يلي ملخصات تحليل الملفات منفردة. "
+        "استخدمها لإصدار التقرير النهائي دون الرجوع للنصوص الخام ودون افتراضات.\n\n"
+        + safe_truncate(merged_summaries, 45000)
+    )
+
+    return call_ai(
+        client,
+        TENDER_SYNTHESIS_PROMPT,
+        final_input,
+        max_tokens=6000,
+        temperature=0.15,
+    )
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1896,21 +2064,19 @@ if st.session_state.module == "tender":
 
         if run_analysis and _require_api():
             client = get_client()
-            combined = ""
-            for name, txt in st.session_state.tender_texts.items():
-                combined += f"\n\n{'='*60}\nالملف: {name}\n{'='*60}\n{safe_truncate(txt, 28000)}\n"
 
-            progress = st.progress(20, text="إرسال للـ AI…")
-            with st.spinner("🧠 يتم تحليل الوثائق… (1-2 دقيقة)"):
-                report = call_ai(client, TENDER_ANALYSIS_PROMPT,
-                                  f"حلل وثائق المناقصة:\n{combined}")
+            progress = st.progress(10, text="تجهيز التحليل المرحلي الآمن…")
+            with st.spinner("🧠 يتم تحليل الوثائق على دفعات آمنة…"):
+                # لا نرسل كل الملفات دفعة واحدة حتى لا يظهر خطأ Request too large.
+                report = analyze_tender_in_batches(client, st.session_state.tender_texts)
                 st.session_state.tender_report = report
+
             progress.progress(100, text="اكتمل!")
             time.sleep(0.4); progress.empty()
             if report.startswith("[AI Error"):
                 st.error(report)
             else:
-                st.success("✅ اكتمل التحليل!")
+                st.success("✅ اكتمل التحليل المرحلي الآمن!")
     else:
         st.markdown("""
         <div style="text-align:center;padding:60px 0;color:#A0AEC0;">
