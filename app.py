@@ -26,6 +26,11 @@ from pathlib import Path
 import pandas as pd
 
 try:
+    import tiktoken
+except Exception:
+    tiktoken = None
+
+try:
     from openai import OpenAI, APIError, RateLimitError, APITimeoutError, AuthenticationError
 except ImportError:
     raise ImportError("openai>=1.40 required. Run: pip install --upgrade openai")
@@ -39,16 +44,28 @@ log = logging.getLogger("TenderLens")
 # ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTS
 # ─────────────────────────────────────────────────────────────────────────────
-# GPT-5.5 Extended configuration
-# ملاحظة: لا يوجد Model ID مستقل باسم "extended"؛ يتم تفعيل التحليل الموسّع عبر reasoning effort = xhigh.
-DEFAULT_MODEL = "gpt-5.5"
-FALLBACK_MODEL = "gpt-5.4-mini"
-AVAILABLE_MODELS = ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-4o", "gpt-4o-mini"]
+# Stable default configuration for Streamlit Cloud.
+# GPT-5.x models remain selectable manually, but the default uses the most stable
+# Chat Completions model to avoid fallback latency when an account lacks GPT-5 access.
+DEFAULT_MODEL = "gpt-4o"
+FALLBACK_MODEL = "gpt-4o-mini"
+AVAILABLE_MODELS = ["gpt-4o", "gpt-4o-mini", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini"]
 DEFAULT_REASONING_EFFORT = "xhigh"
 MAX_FILE_SIZE_MB = 50
 MAX_TOKENS_PER_REQ = 8192
 API_TIMEOUT = 120.0
 API_MAX_RETRIES = 3
+
+# Conservative token budgets to protect Streamlit Cloud and OpenAI rate limits.
+# These are intentionally lower than model context limits because organization TPM/RPM
+# limits can be hit before the model context window is hit.
+MAX_INPUT_TOKENS_PER_FILE = 12_000
+MAX_SYNTHESIS_INPUT_TOKENS = 45_000
+MAX_REVIEW_CONTEXT_TOKENS = 60_000
+MAX_FEEDBACK_CONTEXT_TOKENS = 50_000
+MAX_CHAT_CONTEXT_TOKENS = 35_000
+MAX_DOCGEN_CONTEXT_TOKENS = 35_000
+CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE CONFIG
@@ -166,6 +183,229 @@ def safe_truncate(text: str, max_chars: int) -> str:
     return cut + " […]"
 
 
+def _get_token_encoder(model: str | None = None):
+    """
+    Return a tiktoken encoder when available.
+    Falls back safely because some future model names may not be known by tiktoken yet.
+    """
+    if tiktoken is None:
+        return None
+    model = model or DEFAULT_MODEL
+    try:
+        return tiktoken.encoding_for_model(model)
+    except Exception:
+        for enc_name in ("o200k_base", "cl100k_base"):
+            try:
+                return tiktoken.get_encoding(enc_name)
+            except Exception:
+                continue
+    return None
+
+
+def count_tokens(text: str, model: str | None = None) -> int:
+    """
+    Count tokens for OpenAI requests.
+    If tiktoken is not installed, use a conservative Arabic-safe approximation.
+    """
+    text = text or ""
+    enc = _get_token_encoder(model)
+    if enc is not None:
+        try:
+            return len(enc.encode(text))
+        except Exception:
+            pass
+    # Conservative fallback: Arabic and mixed tender text often tokenizes denser than English.
+    return max(1, math.ceil(len(text) / 2.7))
+
+
+def truncate_to_token_budget(text: str, max_tokens: int, model: str | None = None) -> str:
+    """Truncate text by token budget rather than by raw characters."""
+    text = text or ""
+    if max_tokens <= 0:
+        return ""
+
+    enc = _get_token_encoder(model)
+    if enc is not None:
+        try:
+            toks = enc.encode(text)
+            if len(toks) <= max_tokens:
+                return text
+            return enc.decode(toks[:max_tokens]) + " […]"
+        except Exception:
+            pass
+
+    # Fallback char budget when tiktoken is not installed.
+    approx_chars = int(max_tokens * 2.7)
+    return safe_truncate(text, approx_chars)
+
+
+def build_context_bundle(
+    texts: dict,
+    label: str,
+    max_total_tokens: int,
+    per_file_tokens: int = MAX_INPUT_TOKENS_PER_FILE,
+    model: str | None = None,
+) -> str:
+    """
+    Build a multi-file context under a hard token budget.
+    This prevents Request too large / TPM spikes when users upload many RFP files.
+    """
+    if not texts:
+        return ""
+
+    model = model or st.session_state.get("openai_model", DEFAULT_MODEL)
+    parts: list[str] = []
+    used = 0
+    header_reserve = 120
+
+    for name, txt in texts.items():
+        remaining = max_total_tokens - used - header_reserve
+        if remaining <= 500:
+            parts.append("\n[تم إيقاف إضافة ملفات أخرى لأن ميزانية الرموز المحددة امتلأت.]\n")
+            break
+
+        chunk_budget = max(500, min(per_file_tokens, remaining))
+        body = truncate_to_token_budget(txt or "", chunk_budget, model=model)
+        part = f"=== {label}: {name} ===\n{body}"
+        used += count_tokens(part, model=model)
+        parts.append(part)
+
+    return "\n\n".join(parts)
+
+
+def sanitize_csv_cell(value):
+    """Prevent CSV Formula Injection when opening exports in Excel."""
+    if isinstance(value, str) and value and value[0] in CSV_FORMULA_PREFIXES:
+        return "'" + value
+    return value
+
+
+def sanitize_dataframe_for_csv(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a copy of DataFrame with formula-like cells safely escaped for CSV."""
+    if df is None or df.empty:
+        return df
+    safe_df = df.copy()
+    for col in safe_df.columns:
+        safe_df[col] = safe_df[col].map(sanitize_csv_cell)
+    return safe_df
+
+
+def release_heavy_state_keys(*keys: str) -> None:
+    """Delete heavy session_state entries safely to reduce Streamlit Cloud RAM pressure."""
+    for key in keys:
+        try:
+            if key in st.session_state:
+                del st.session_state[key]
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PDF RTL / ARABIC HELPERS — ReportLab-safe text handling
+# ─────────────────────────────────────────────────────────────────────────────
+def _contains_arabic(text: str) -> bool:
+    """Return True if text contains Arabic Unicode ranges."""
+    return bool(re.search(r"[\u0600-\u06FF\u0750-\u077F\u08A0-\u08FF]", str(text or "")))
+
+
+@st.cache_resource(show_spinner=False)
+def get_pdf_font_names() -> tuple[str, str]:
+    """
+    Register a Unicode font for ReportLab when available.
+    - Prefer bundled fonts/DejaVuSans.ttf when present.
+    - Fallback to common Linux DejaVu paths on Streamlit Cloud.
+    - Fallback to Helvetica only if no Unicode font exists.
+    """
+    try:
+        from reportlab.pdfbase import pdfmetrics
+        from reportlab.pdfbase.ttfonts import TTFont
+        from reportlab.pdfbase.pdfmetrics import registerFontFamily
+
+        regular_candidates = [
+            Path("fonts/DejaVuSans.ttf"),
+            Path("DejaVuSans.ttf"),
+            Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+            Path("/usr/local/share/fonts/DejaVuSans.ttf"),
+        ]
+        bold_candidates = [
+            Path("fonts/DejaVuSans-Bold.ttf"),
+            Path("DejaVuSans-Bold.ttf"),
+            Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+            Path("/usr/local/share/fonts/DejaVuSans-Bold.ttf"),
+        ]
+
+        regular_path = next((p for p in regular_candidates if p.exists()), None)
+        bold_path = next((p for p in bold_candidates if p.exists()), None) or regular_path
+        if not regular_path:
+            return "Helvetica", "Helvetica-Bold"
+
+        try:
+            pdfmetrics.getFont("TLPArabic")
+        except Exception:
+            pdfmetrics.registerFont(TTFont("TLPArabic", str(regular_path)))
+
+        try:
+            pdfmetrics.getFont("TLPArabic-Bold")
+        except Exception:
+            pdfmetrics.registerFont(TTFont("TLPArabic-Bold", str(bold_path)))
+
+        try:
+            registerFontFamily(
+                "TLPArabic",
+                normal="TLPArabic",
+                bold="TLPArabic-Bold",
+                italic="TLPArabic",
+                boldItalic="TLPArabic-Bold",
+            )
+        except Exception:
+            pass
+
+        return "TLPArabic", "TLPArabic-Bold"
+    except Exception as e:
+        log.warning(f"Arabic PDF font registration skipped: {e}")
+        return "Helvetica", "Helvetica-Bold"
+
+
+def prepare_pdf_text(text) -> str:
+    """
+    Prepare Arabic/RTL text for ReportLab Paragraph while preserving simple
+    ReportLab markup tags such as <b>, <font>, <br/>.
+    """
+    s = "" if text is None else str(text)
+    if not _contains_arabic(s):
+        return s
+    try:
+        import arabic_reshaper
+        from bidi.algorithm import get_display
+
+        parts = re.split(r"(<[^>]+>)", s)
+        shaped_parts = []
+        for part in parts:
+            if not part:
+                continue
+            if part.startswith("<") and part.endswith(">"):
+                shaped_parts.append(part)
+            elif _contains_arabic(part):
+                shaped_parts.append(get_display(arabic_reshaper.reshape(part)))
+            else:
+                shaped_parts.append(part)
+        return "".join(shaped_parts)
+    except Exception as e:
+        log.warning(f"Arabic PDF shaping skipped: {e}")
+        return s
+
+
+def pdf_font_alias(font: str | None, regular_font: str, bold_font: str) -> str:
+    """Map legacy Helvetica font requests to registered Unicode fonts."""
+    if not font:
+        return regular_font
+    if font in {"Helvetica-Bold", "Times-Bold", "Courier-Bold"}:
+        return bold_font
+    if font in {"Helvetica", "Times-Roman", "Courier"}:
+        return regular_font
+    return font
+
+
 def validate_uploaded_file(uploaded_file, max_mb: int = MAX_FILE_SIZE_MB) -> tuple[bool, str]:
     """تحقق من صلاحية الملف المرفوع."""
     if uploaded_file is None:
@@ -272,7 +512,7 @@ def test_api_connection() -> tuple[bool, str]:
 # AI CALLS — UNIFIED & HARDENED
 # ─────────────────────────────────────────────────────────────────────────────
 def _is_responses_model(model: str) -> bool:
-    """النماذج الحديثة GPT-5.x تعمل عبر Responses API لضمان دعم reasoning effort."""
+    """Use Responses API only for GPT-5.x models when explicitly selected."""
     return str(model or "").startswith("gpt-5")
 
 
@@ -328,7 +568,7 @@ def call_ai(
 ) -> str:
     """
     استدعاء AI موحَّد مع معالجة شاملة للأخطاء وإعادة المحاولة.
-    يعتمد GPT-5.5 كخيار افتراضي عبر Responses API مع reasoning effort = xhigh.
+    يستخدم النموذج الافتراضي المستقر، ويدعم GPT-5.x اختيارياً عبر Responses API.
     """
     if client is None:
         return "[AI Error: لا يوجد عميل OpenAI. أدخل مفتاح API في الشريط الجانبي.]"
@@ -368,6 +608,11 @@ def call_ai(
         except APIError as e:
             last_err = e
             msg = str(e).lower()
+            if is_request_too_large_error(str(e)):
+                return (
+                    "[AI Error: الطلب أكبر من حدود نموذج/حساب OpenAI الحالي. "
+                    "تم منع إعادة المحاولة غير المفيدة. الحل: قلل حجم الملفات أو استخدم التحليل المرحلي.]"
+                )
             if ("model" in msg or "unsupported" in msg or "not found" in msg) and attempt == 0:
                 model = FALLBACK_MODEL
                 log.warning(f"Falling back to {FALLBACK_MODEL}")
@@ -429,11 +674,13 @@ def is_request_too_large_error(text: str) -> bool:
     return "request too large" in t or "tokens per min" in t or "maximum context" in t
 
 
-def build_compact_context_from_file(name: str, txt: str, max_chars: int = 18000) -> str:
-    """تجهيز سياق محدود وآمن لكل ملف بدلاً من إرسال كل النص الخام دفعة واحدة."""
+def build_compact_context_from_file(name: str, txt: str, max_chars: int = 18000, max_tokens: int | None = None) -> str:
+    """تجهيز سياق محدود وآمن لكل ملف باستخدام ميزانية رموز لا أحرف فقط."""
     cleaned = re.sub(r"\n{3,}", "\n\n", txt or "")
     cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
-    return f"\n\n{'='*50}\nالملف: {name}\n{'='*50}\n{safe_truncate(cleaned, max_chars)}"
+    token_budget = max_tokens or max(1500, min(MAX_INPUT_TOKENS_PER_FILE, int(max_chars / 2)))
+    limited = truncate_to_token_budget(cleaned, token_budget)
+    return f"\n\n{'='*50}\nالملف: {name}\n{'='*50}\n{limited}"
 
 
 SINGLE_FILE_TENDER_PROMPT = """أنت مهندس مكتب فني أول وخبير تحليل وثائق مناقصات.
@@ -507,7 +754,7 @@ def analyze_tender_in_batches(client, tender_texts: dict) -> str:
         if summary.startswith("[AI Error"):
             per_file_summaries.append(f"# {name}\nتعذر تحليل هذا الملف: {summary}")
         else:
-            per_file_summaries.append(f"# {name}\n{safe_truncate(summary, 6000)}")
+            per_file_summaries.append(f"# {name}\n{truncate_to_token_budget(summary, 1800)}")
 
         # تهدئة بسيطة لتقليل ضغط rate limit على الحسابات الصغيرة
         time.sleep(0.8)
@@ -517,7 +764,7 @@ def analyze_tender_in_batches(client, tender_texts: dict) -> str:
     final_input = (
         "فيما يلي ملخصات تحليل الملفات منفردة. "
         "استخدمها لإصدار التقرير النهائي دون الرجوع للنصوص الخام ودون افتراضات.\n\n"
-        + safe_truncate(merged_summaries, 45000)
+        + truncate_to_token_budget(merged_summaries, MAX_SYNTHESIS_INPUT_TOKENS)
     )
 
     return call_ai(
@@ -671,7 +918,7 @@ def extract_boq_ai(client, text: str) -> list[dict]:
     """استخراج بنود BOQ من نص غير منظم باستخدام AI."""
     if not text or not client:
         return []
-    snippet = safe_truncate(text, 35000)
+    snippet = truncate_to_token_budget(text, MAX_INPUT_TOKENS_PER_FILE)
     raw = call_ai_json(
         client,
         BOQ_AI_PROMPT,
@@ -767,7 +1014,9 @@ def df_to_excel_bytes(df: pd.DataFrame, project_name: str = "BOQ") -> bytes:
 
 
 def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8-sig")
+    """Export CSV safely after neutralizing formula-like cells for Excel."""
+    safe_df = sanitize_dataframe_for_csv(df)
+    return safe_df.to_csv(index=False).encode("utf-8-sig")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -786,7 +1035,7 @@ RISK_COLORS = {"HIGH": "#DC2626", "MEDIUM": "#D97706", "LOW": "#059669"}
 def ai_extract_clauses(client, text: str) -> list[dict]:
     if not text or not client:
         return []
-    chunk = safe_truncate(text, 30000)
+    chunk = truncate_to_token_budget(text, MAX_INPUT_TOKENS_PER_FILE)
     raw = call_ai_json(client, CLAUSE_TRACKER_PROMPT, chunk)
     return raw if isinstance(raw, list) else []
 
@@ -1014,12 +1263,12 @@ def generate_feedback_html(report_text: str, meta: dict) -> str:
             is_bull = l[0] in ("-", "•", "*")
             if is_num or is_bull:
                 if not in_list:
-                    body_parts.append('<ol style="margin:8px 0 0 24px;line-height:2;">'); in_list = True
-                body_parts.append(f"<li>{_esc(l.lstrip('-•* 0123456789.)'))}</li>")
+                    body_parts.append('<ol style="margin:8px 0 0 0;line-height:2;direction:rtl;text-align:right;unicode-bidi:embed;padding-right:24px;padding-left:0;">'); in_list = True
+                body_parts.append(f'<li style="direction:rtl;text-align:right;unicode-bidi:embed;">{_esc(l.lstrip("-•* 0123456789.)"))}</li>')
             else:
                 if in_list:
                     body_parts.append("</ol>"); in_list = False
-                body_parts.append(f'<p style="margin:6px 0;">{_esc(l)}</p>')
+                body_parts.append(f'<p style="margin:6px 0;direction:rtl;text-align:right;unicode-bidi:embed;">{_esc(l)}</p>')
         if in_list:
             body_parts.append("</ol>")
 
@@ -1039,7 +1288,8 @@ body{{font-family:'Segoe UI',Arial,sans-serif;background:#F1F5F9;color:#1e293b;d
 .hdr h1{{margin:0 0 6px;font-size:26px;letter-spacing:.5px;}}
 .hdr p{{margin:0;font-size:13px;color:#FFB81C;font-weight:700;}}
 .meta{{border-collapse:collapse;width:100%;font-size:12px;}}
-.body{{padding:28px 34px;}}
+.body{{padding:28px 34px;direction:rtl;text-align:right;unicode-bidi:embed;}}
+.body p,.body li{{direction:rtl;text-align:right;unicode-bidi:embed;}}
 .foot{{text-align:center;padding:16px;font-size:11px;color:#94a3b8;border-top:1px solid #E2E8F0;background:#F8FAFC;}}
 </style></head><body><div class="wrap">
 <div class="hdr"><h1>🏛️ TenderLens Pro | By Eng. Ahmed Almaamari</h1>
@@ -1072,7 +1322,7 @@ _MILESTONE_CATS = {
 def ai_extract_milestones(client, text: str) -> list[dict]:
     if not text or not client:
         return []
-    chunk = safe_truncate(text, 32000)
+    chunk = truncate_to_token_budget(text, MAX_INPUT_TOKENS_PER_FILE)
     raw = call_ai_json(client, MILESTONE_PROMPT, chunk)
     return raw if isinstance(raw, list) else []
 
@@ -1381,65 +1631,125 @@ def compare_tender_snapshots(selected: list[dict]) -> dict:
 # ─────────────────────────────────────────────────────────────────────────────
 def generate_plan_docx(plan_type: str, plan_content: str, project_name: str,
                        structure: list, template_bytes: bytes | None = None) -> bytes:
+    """
+    Generate a Word document safely.
+
+    Hardened behavior:
+    - Uses docxtpl when the uploaded template contains Jinja placeholders.
+    - Avoids direct XML manipulation such as paragraph._p.remove(...).
+    - If the template has no placeholders, the generated content is appended
+      safely with python-docx while preserving the original template file.
+
+    Supported placeholders inside DOCX templates:
+      {{ project_name }}, {{ plan_type }}, {{ content }}, {{ generated_at }},
+      {{ outline }}, {{ sections }}, {{ structure }}
+    """
     from docx import Document
-    from docx.oxml.ns import qn
-
-    doc = Document(io.BytesIO(template_bytes)) if template_bytes else Document()
-
-    def _clear_paragraph(paragraph):
-        for child in list(paragraph._p):
-            if child.tag != qn("w:pPr"):
-                paragraph._p.remove(child)
-
-    def _set_text_keep_style(paragraph, text):
-        if not paragraph.runs:
-            paragraph.add_run("")
-        _clear_paragraph(paragraph)
-        run = paragraph.add_run(text)
-        if paragraph.runs:
-            src = paragraph.runs[0]
-            run.bold = src.bold; run.italic = src.italic; run.underline = src.underline
-            run.font.name = src.font.name; run.font.size = src.font.size
-            if src.font.color and src.font.color.rgb:
-                run.font.color.rgb = src.font.color.rgb
 
     def _parse_sections(text: str) -> list[dict]:
-        out = []; current = None
-        for line in text.splitlines():
+        out: list[dict] = []
+        current: dict | None = None
+        for line in (text or "").splitlines():
             if line.startswith("## "):
-                if current: out.append(current)
-                current = {"heading": line.strip(), "body": []}
-            elif current:
+                if current:
+                    out.append(current)
+                current = {"heading": line.replace("## ", "", 1).strip(), "body": []}
+            elif current is not None:
                 current["body"].append(line)
-        if current: out.append(current)
+        if current:
+            out.append(current)
         return out
 
-    sections = _parse_sections(plan_content)
-    paragraphs = list(doc.paragraphs)
-    section_iter = iter(sections)
-    current_section = next(section_iter, None)
-    for para in paragraphs:
-        text = para.text.strip()
-        if current_section is None:
-            break
-        if text == current_section["heading"] or text.startswith("## "):
-            _set_text_keep_style(para, current_section["heading"])
-            current_section = next(section_iter, None)
-        elif text:
-            body_text = "\n".join([ln for ln in current_section["body"] if ln.strip()]).strip()
-            if body_text:
-                _set_text_keep_style(para, body_text)
+    def _outline_from_structure(items: list) -> str:
+        lines = []
+        for s in items or []:
+            if isinstance(s, dict):
+                num = str(s.get("number", "")).strip()
+                title = str(s.get("title", "")).strip()
+                lines.append(f"{num} {title}".strip())
+        return "\n".join([ln for ln in lines if ln])
 
+    def _docx_has_placeholders(doc: Document) -> bool:
+        markers = ("{{", "}}", "{%", "%}")
+        texts = []
+        texts.extend(p.text for p in doc.paragraphs)
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    texts.extend(p.text for p in cell.paragraphs)
+        return any(any(m in t for m in markers) for t in texts)
+
+    def _append_generated_content(doc: Document, content: str) -> None:
+        if len(doc.paragraphs) > 0 or len(doc.tables) > 0:
+            doc.add_page_break()
+        doc.add_heading(plan_type or "Generated Plan", level=1)
+        if project_name:
+            p = doc.add_paragraph()
+            p.add_run("Project: ").bold = True
+            p.add_run(project_name)
+        doc.add_paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        doc.add_paragraph("")
+
+        for line in (content or "").splitlines():
+            stripped = line.strip()
+            if not stripped:
+                doc.add_paragraph("")
+                continue
+            if stripped.startswith("## "):
+                doc.add_heading(stripped.replace("## ", "", 1).strip(), level=2)
+            elif stripped.startswith("# "):
+                doc.add_heading(stripped.replace("# ", "", 1).strip(), level=1)
+            elif stripped.startswith(("- ", "• ")):
+                doc.add_paragraph(stripped[2:].strip(), style="List Bullet")
+            elif re.match(r"^\d+[\.)]\s+", stripped):
+                doc.add_paragraph(re.sub(r"^\d+[\.)]\s+", "", stripped), style="List Number")
+            else:
+                doc.add_paragraph(stripped)
+
+    sections = _parse_sections(plan_content)
+    context = {
+        "project_name": project_name or "",
+        "plan_type": plan_type or "",
+        "content": plan_content or "",
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "outline": _outline_from_structure(structure),
+        "sections": sections,
+        "structure": structure or [],
+    }
+
+    if template_bytes:
+        base_doc = Document(io.BytesIO(template_bytes))
+        has_placeholders = _docx_has_placeholders(base_doc)
+
+        if has_placeholders:
+            try:
+                from docxtpl import DocxTemplate
+                tpl = DocxTemplate(io.BytesIO(template_bytes))
+                tpl.render(context)
+                buf = io.BytesIO()
+                tpl.save(buf)
+                return buf.getvalue()
+            except Exception as e:
+                log.warning(f"docxtpl render failed, falling back to safe append: {e}")
+                doc = Document(io.BytesIO(template_bytes))
+                _append_generated_content(doc, plan_content)
+                buf = io.BytesIO(); doc.save(buf); return buf.getvalue()
+
+        _append_generated_content(base_doc, plan_content)
+        buf = io.BytesIO(); base_doc.save(buf); return buf.getvalue()
+
+    doc = Document()
+    _append_generated_content(doc, plan_content)
     buf = io.BytesIO(); doc.save(buf); return buf.getvalue()
 
 
 def build_docgen_context() -> str:
     parts = []
     if st.session_state.get("tender_report", "").strip():
-        parts.append(safe_truncate(st.session_state.tender_report, 10000))
+        parts.append(truncate_to_token_budget(st.session_state.tender_report, 3000))
     if st.session_state.get("tender_texts"):
         for name, txt in list(st.session_state.tender_texts.items())[:4]:
-            parts.append(f"=== {name} ===\n{safe_truncate(txt, 7000)}")
+            parts.append(f"=== {name} ===\n{truncate_to_token_budget(txt, 2200)}")
     return "\n\n".join(parts) if parts else "No tender context loaded."
 
 
@@ -1455,7 +1765,7 @@ def build_visual_prompt(text: str, mode: str) -> dict:
     prompt = (
         f"{prompt_kind}, Navy Blue and Gold corporate palette, "
         f"clean executive composition, premium construction proposal aesthetic, "
-        f"technical detail, crisp labels, polished presentation, tailored to: {safe_truncate(text, 1800)}"
+        f"technical detail, crisp labels, polished presentation, tailored to: {truncate_to_token_budget(text, 650)}"
     )
     return {
         "type": mode, "prompt": prompt,
@@ -1482,9 +1792,12 @@ def generate_comparison_pdf(projects: list[dict], decision: dict, title: str) ->
     GRAY = rlcolors.HexColor("#64748B"); BLACK = rlcolors.HexColor("#0F172A")
     WHITE = rlcolors.white
 
-    def P(txt, size=9, color=BLACK, font="Helvetica", align=TA_LEFT, leading=None):
-        return Paragraph(txt, ParagraphStyle("__", fontSize=size, textColor=color,
-                                              fontName=font, alignment=align, leading=leading or size + 4))
+    REGULAR_FONT, BOLD_FONT = get_pdf_font_names()
+
+    def P(txt, size=9, color=BLACK, font=None, align=TA_LEFT, leading=None):
+        font_name = pdf_font_alias(font, REGULAR_FONT, BOLD_FONT)
+        return Paragraph(prepare_pdf_text(txt), ParagraphStyle("__", fontSize=size, textColor=color,
+                                              fontName=font_name, alignment=align, leading=leading or size + 4))
 
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=16*mm, rightMargin=16*mm,
@@ -1568,9 +1881,12 @@ def generate_gonogo_pdf(verdict_data: dict, dashboard_data: dict, project_name: 
                             topMargin=10*mm, bottomMargin=15*mm)
     W = A4[0] - 36*mm
 
-    def P(txt, size=9, color=BLACK, font="Helvetica", align=TA_LEFT, leading=None):
-        return Paragraph(txt, ParagraphStyle("__", fontSize=size, textColor=color,
-                                              fontName=font, alignment=align, leading=leading or (size+4)))
+    REGULAR_FONT, BOLD_FONT = get_pdf_font_names()
+
+    def P(txt, size=9, color=BLACK, font=None, align=TA_LEFT, leading=None):
+        font_name = pdf_font_alias(font, REGULAR_FONT, BOLD_FONT)
+        return Paragraph(prepare_pdf_text(txt), ParagraphStyle("__", fontSize=size, textColor=color,
+                                              fontName=font_name, alignment=align, leading=leading or (size+4)))
 
     story = []
     hdr = Table([[
@@ -2038,11 +2354,12 @@ if st.session_state.module == "tender":
     if st.session_state.tender_texts:
         total_words = sum(word_count(v) for v in st.session_state.tender_texts.values())
         total_chars = sum(len(v) for v in st.session_state.tender_texts.values())
+        total_tokens = sum(count_tokens(v) for v in st.session_state.tender_texts.values())
         c = st.columns(4)
         c[0].metric("الملفات", len(st.session_state.tender_texts))
         c[1].metric("الكلمات", f"{total_words:,}")
         c[2].metric("الأحرف", f"{total_chars:,}")
-        c[3].metric("السياق", f"{total_chars // 1000}K")
+        c[3].metric("السياق", f"~{total_tokens:,} token")
 
         st.markdown("**الملفات المحملة:**")
         for fname in st.session_state.tender_texts:
@@ -2105,6 +2422,11 @@ if st.session_state.module == "tender":
                 raw_combined = "\n\n".join(f"=== {n} ===\n{t}" for n, t in st.session_state.tender_texts.items())
                 st.download_button("⬇️ Raw", raw_combined.encode("utf-8"),
                                     f"RawText_{ts}.txt", "text/plain", use_container_width=True)
+            if st.button("🧹 تفريغ النصوص الخام من الذاكرة مع إبقاء التقرير", key="t_release_raw", use_container_width=True):
+                st.session_state.tender_texts = {}
+                st.session_state.tender_chat = []
+                st.success("تم تفريغ النصوص الخام من الذاكرة. بقي التقرير النهائي محفوظاً.")
+                st.rerun()
             st.markdown("---")
 
             sections = re.split(r'\n(?=# )', st.session_state.tender_report)
@@ -2145,8 +2467,12 @@ if st.session_state.module == "tender":
 
             if submitted and q.strip() and _require_api():
                 client = get_client()
-                combined = "\n\n".join(f"=== {n} ===\n{safe_truncate(t, 20000)}"
-                                        for n, t in st.session_state.tender_texts.items())
+                combined = build_context_bundle(
+                    st.session_state.tender_texts,
+                    "وثيقة",
+                    max_total_tokens=MAX_CHAT_CONTEXT_TOKENS,
+                    per_file_tokens=8_000,
+                )
                 with st.spinner("جاري البحث…"):
                     answer = call_ai(client, CHAT_SYSTEM + f"\n\nالوثائق:\n{combined}", q)
                 st.session_state.tender_chat.append({"role": "user", "content": q})
@@ -2223,10 +2549,18 @@ elif st.session_state.module == "review":
 
     if run_review and can_review and _require_api():
         client = get_client()
-        req_ctx = "\n".join(f"=== متطلبات: {n} ===\n{safe_truncate(t, 25000)}"
-                            for n, t in st.session_state.req_texts.items())
-        prop_ctx = "\n".join(f"=== عرض: {n} ===\n{safe_truncate(t, 25000)}"
-                              for n, t in st.session_state.prop_texts.items())
+        req_ctx = build_context_bundle(
+            st.session_state.req_texts,
+            "متطلبات",
+            max_total_tokens=MAX_REVIEW_CONTEXT_TOKENS // 2,
+            per_file_tokens=10_000,
+        )
+        prop_ctx = build_context_bundle(
+            st.session_state.prop_texts,
+            "عرض",
+            max_total_tokens=MAX_REVIEW_CONTEXT_TOKENS // 2,
+            per_file_tokens=10_000,
+        )
         progress = st.progress(25, text="إرسال للـ AI…")
         with st.spinner("🧠 جاري المقارنة… (1-3 دقائق)"):
             review = call_ai(client, PROPOSAL_REVIEW_PROMPT,
@@ -2315,10 +2649,18 @@ elif st.session_state.module == "review":
 
             if gen_fb and _require_api():
                 client = get_client()
-                req_ctx = "\n".join(f"=== متطلبات: {n} ===\n{safe_truncate(t, 20000)}"
-                                    for n, t in st.session_state.req_texts.items())
-                prop_ctx = "\n".join(f"=== عرض: {n} ===\n{safe_truncate(t, 20000)}"
-                                      for n, t in st.session_state.prop_texts.items())
+                req_ctx = build_context_bundle(
+                    st.session_state.req_texts,
+                    "متطلبات",
+                    max_total_tokens=MAX_FEEDBACK_CONTEXT_TOKENS // 2,
+                    per_file_tokens=8_000,
+                )
+                prop_ctx = build_context_bundle(
+                    st.session_state.prop_texts,
+                    "عرض",
+                    max_total_tokens=MAX_FEEDBACK_CONTEXT_TOKENS // 2,
+                    per_file_tokens=8_000,
+                )
                 with st.spinner("🧠 جاري التوليد…"):
                     fb_text = call_ai(client, FEEDBACK_REPORT_PROMPT,
                                        f"المتطلبات:\n{req_ctx}\n\nالعرض:\n{prop_ctx}")
@@ -2373,7 +2715,7 @@ elif st.session_state.module == "review":
                 qr = st.text_input("سؤالك", label_visibility="collapsed")
                 if st.form_submit_button("إرسال →", use_container_width=True) and qr.strip() and _require_api():
                     client = get_client()
-                    ctx = f"تقرير المراجعة:\n{st.session_state.review_report}"
+                    ctx = "تقرير المراجعة:\n" + truncate_to_token_budget(st.session_state.review_report, 8_000)
                     with st.spinner("…"):
                         ans = call_ai(client, CHAT_SYSTEM + f"\n\n{ctx}", qr)
                     st.session_state.review_chat.append({"role": "user", "content": qr})
@@ -2462,6 +2804,8 @@ elif st.session_state.module == "boq":
                 if "source_file" in df.columns:
                     df = df.rename(columns={"source_file": "Source File"})
                 st.session_state.boq_df = df
+                # Raw PDF bytes are only needed during extraction; release them to reduce Streamlit Cloud RAM usage.
+                st.session_state.boq_tables_raw = {}
                 progress.progress(100); time.sleep(0.3); progress.empty()
                 st.success(f"✅ تم استخراج {len(df):,} بند!")
 
@@ -2951,6 +3295,7 @@ elif st.session_state.module == "docgen":
                 if st.button("🗑️", key=f"dg_c_{key}", use_container_width=True):
                     st.session_state.docgen_ref_texts[key] = None
                     st.session_state.docgen_ref_names[key] = ""
+                    st.session_state.docgen_ref_bytes.pop(key, None)
                     st.session_state.docgen_structures[key] = None
                     st.session_state.docgen_outputs[key] = ""
                     st.rerun()
@@ -2959,7 +3304,7 @@ elif st.session_state.module == "docgen":
                 client = get_client()
                 with st.spinner("🧠 تحليل البنية…"):
                     raw = call_ai_json(client, STRUCTURE_EXTRACTION_PROMPT,
-                                        f"Document text:\n\n{safe_truncate(ref_text, 30000)}")
+                                        f"Document text:\n\n{truncate_to_token_budget(ref_text, MAX_DOCGEN_CONTEXT_TOKENS)}")
                 if isinstance(raw, list) and raw:
                     st.session_state.docgen_structures[key] = raw
                     st.success(f"✅ {len(raw)} قسم")
@@ -2975,8 +3320,11 @@ elif st.session_state.module == "docgen":
 
                 st.markdown("---")
                 st.markdown("#### Step 3 — توليد المحتوى")
+                has_template_bytes = bool(st.session_state.docgen_ref_bytes.get(key))
+                if not has_template_bytes:
+                    st.warning("⚠️ تم حذف قالب Word من الذاكرة. أعد رفع القالب قبل توليد المحتوى أو التصدير.")
                 if st.button(f"🚀 توليد {plan_def['short']}", key=f"dg_g_{key}",
-                              use_container_width=True, type="primary"):
+                              use_container_width=True, type="primary", disabled=not has_template_bytes):
                     if _require_api():
                         client = get_client()
                         outline = _struct_to_outline(struct)
@@ -3002,11 +3350,14 @@ elif st.session_state.module == "docgen":
                     e1, e2 = st.columns(2)
                     with e1:
                         try:
-                            db = generate_plan_docx(plan_def["short"], output, _proj_name, struct,
-                                                     st.session_state.docgen_ref_bytes.get(key))
-                            st.download_button(f"📄 Word", db, f"TLP_{key}_{ts_d}.docx",
-                                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                                use_container_width=True, type="primary", key=f"dg_dl_{key}")
+                            template_bytes = st.session_state.docgen_ref_bytes.get(key)
+                            if not template_bytes:
+                                st.warning("⚠️ لا يمكن تصدير Word لأن قالب DOCX غير موجود في الذاكرة. أعد رفع القالب أولاً.")
+                            else:
+                                db = generate_plan_docx(plan_def["short"], output, _proj_name, struct, template_bytes)
+                                st.download_button(f"📄 Word", db, f"TLP_{key}_{ts_d}.docx",
+                                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                                    use_container_width=True, type="primary", key=f"dg_dl_{key}")
                         except Exception as e:
                             st.error(f"DOCX: {e}")
                     with e2:
