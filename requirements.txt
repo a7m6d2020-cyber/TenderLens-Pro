@@ -2,3 +2,5 @@ streamlit
 openai==0.28.0
 python-docx
 PyPDF2
+pdfplumber
+pandas
