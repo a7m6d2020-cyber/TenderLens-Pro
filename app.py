@@ -175,13 +175,28 @@ def validate_uploaded_file(uploaded_file, max_mb: int = MAX_FILE_SIZE_MB) -> tup
 
 # ─────────────────────────────────────────────────────────────────────────────
 # OPENAI CLIENT — DIRECT INTEGRATION (replaces Replit)
+# Streamlit Cloud safe: avoids OpenAI/httpx "proxies" incompatibility
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_resource(show_spinner=False)
 def _build_openai_client(api_key: str) -> OpenAI:
-    """بناء عميل OpenAI مع كاش الموارد."""
+    """
+    بناء عميل OpenAI مع كاش الموارد.
+
+    ملاحظة تشغيلية:
+    تمرير http_client صراحة يمنع انهيار بعض بيئات Streamlit Cloud عند اجتماع
+    إصدارات OpenAI قديمة نسبياً مع httpx>=0.28، حيث يظهر الخطأ:
+    Client.__init__() got an unexpected keyword argument 'proxies'.
+    """
+    import httpx
+
+    http_client = httpx.Client(
+        timeout=httpx.Timeout(API_TIMEOUT, connect=30.0),
+        follow_redirects=True,
+    )
+
     return OpenAI(
         api_key=api_key,
-        timeout=API_TIMEOUT,
+        http_client=http_client,
         max_retries=API_MAX_RETRIES,
     )
 
@@ -191,19 +206,19 @@ def get_openai_client():
     جلب عميل OpenAI من إعدادات المستخدم.
     الأولوية:
       1. مفتاح من session_state (يدخله المستخدم)
-      2. متغير بيئة OPENAI_API_KEY (للتشغيل المحلي)
-      3. st.secrets["OPENAI_API_KEY"] (للنشر على Streamlit Cloud)
+      2. st.secrets["OPENAI_API_KEY"] (للنشر على Streamlit Cloud)
+      3. متغير بيئة OPENAI_API_KEY (للتشغيل المحلي)
     """
-    api_key = st.session_state.get("user_api_key", "").strip()
-
-    if not api_key:
-        api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    api_key = (st.session_state.get("user_api_key", "") or "").strip()
 
     if not api_key:
         try:
-            api_key = st.secrets.get("OPENAI_API_KEY", "").strip()
+            api_key = (st.secrets.get("OPENAI_API_KEY", "") or "").strip()
         except Exception:
-            pass
+            api_key = ""
+
+    if not api_key:
+        api_key = (os.environ.get("OPENAI_API_KEY", "") or "").strip()
 
     if not api_key or not api_key.startswith("sk-"):
         return None
@@ -211,7 +226,7 @@ def get_openai_client():
     try:
         return _build_openai_client(api_key)
     except Exception as e:
-        log.error(f"Client build failed: {e}")
+        log.exception(f"Client build failed: {e}")
         return None
 
 
@@ -224,25 +239,29 @@ def test_api_connection() -> tuple[bool, str]:
     """اختبار سريع لصحة المفتاح والاتصال."""
     client = get_openai_client()
     if not client:
-        return False, "لم يتم تكوين مفتاح API."
+        return False, "لم يتم تكوين عميل OpenAI. تحقق من المفتاح أو من إعدادات Streamlit Secrets."
     try:
         resp = client.chat.completions.create(
             model=st.session_state.get("openai_model", DEFAULT_MODEL),
-            messages=[{"role": "user", "content": "ping"}],
-            max_tokens=5,
-            timeout=20.0,
+            messages=[{"role": "user", "content": "Reply with OK only."}],
+            max_tokens=20,
+            temperature=0,
+            timeout=30.0,
         )
-        return True, f"✅ الاتصال ناجح ({resp.model})"
+        content = (resp.choices[0].message.content or "").strip()
+        if not content:
+            return False, "تم الاتصال لكن الاستجابة فارغة. جرّب نموذجاً أخف مثل gpt-4o-mini."
+        return True, f"✅ الاتصال ناجح ({resp.model}) — {content[:40]}"
     except AuthenticationError:
-        return False, "❌ المفتاح غير صالح."
+        return False, "❌ المفتاح غير صالح أو لا يملك صلاحية."
     except APITimeoutError:
         return False, "❌ انتهت مهلة الاتصال."
     except RateLimitError:
-        return False, "⚠️ تم تجاوز حد المعدل."
+        return False, "⚠️ تم تجاوز حد المعدل أو الرصيد غير كافٍ."
     except APIError as e:
-        return False, f"❌ خطأ API: {str(e)[:100]}"
+        return False, f"❌ خطأ API: {str(e)[:180]}"
     except Exception as e:
-        return False, f"❌ فشل: {str(e)[:100]}"
+        return False, f"❌ فشل غير متوقع: {type(e).__name__}: {str(e)[:180]}"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
