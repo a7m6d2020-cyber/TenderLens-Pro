@@ -65,6 +65,11 @@ MAX_REVIEW_CONTEXT_TOKENS = 60_000
 MAX_FEEDBACK_CONTEXT_TOKENS = 50_000
 MAX_CHAT_CONTEXT_TOKENS = 35_000
 MAX_DOCGEN_CONTEXT_TOKENS = 35_000
+# Tender analysis uses one focused pass when total extracted context fits this budget.
+# If the uploaded tender set is larger, the app automatically uses staged extraction
+# to avoid losing owner requirements or triggering OpenAI request-size/rate-limit errors.
+MAX_SINGLE_PASS_TENDER_TOKENS = 48_000
+TENDER_ANALYSIS_SLEEP_SECONDS = 1.5
 CSV_FORMULA_PREFIXES = ("=", "+", "-", "@", "\t", "\r")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -321,14 +326,24 @@ def get_pdf_font_names() -> tuple[str, str]:
         from reportlab.pdfbase.ttfonts import TTFont
         from reportlab.pdfbase.pdfmetrics import registerFontFamily
 
+        # Production rule: prefer a bundled font committed to the repository.
+        # Place your licensed Arabic/Unicode font under ./fonts/ to avoid cloud-host roulette.
         regular_candidates = [
+            Path("fonts/TenderLensArabic-Regular.ttf"),
             Path("fonts/DejaVuSans.ttf"),
+            Path("fonts/Arial.ttf"),
+            Path("fonts/arial.ttf"),
+            Path("fonts/SakkalMajalla.ttf"),
             Path("DejaVuSans.ttf"),
             Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
             Path("/usr/local/share/fonts/DejaVuSans.ttf"),
         ]
         bold_candidates = [
+            Path("fonts/TenderLensArabic-Bold.ttf"),
             Path("fonts/DejaVuSans-Bold.ttf"),
+            Path("fonts/Arial-Bold.ttf"),
+            Path("fonts/arialbd.ttf"),
+            Path("fonts/SakkalMajallaBold.ttf"),
             Path("DejaVuSans-Bold.ttf"),
             Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
             Path("/usr/local/share/fonts/DejaVuSans-Bold.ttf"),
@@ -337,6 +352,11 @@ def get_pdf_font_names() -> tuple[str, str]:
         regular_path = next((p for p in regular_candidates if p.exists()), None)
         bold_path = next((p for p in bold_candidates if p.exists()), None) or regular_path
         if not regular_path:
+            log.warning(
+                "No bundled Arabic/Unicode PDF font found. "
+                "Add fonts/DejaVuSans.ttf and fonts/DejaVuSans-Bold.ttf, "
+                "or your licensed Arabic font, to guarantee Arabic PDF rendering."
+            )
             return "Helvetica", "Helvetica-Bold"
 
         try:
@@ -685,95 +705,160 @@ def build_compact_context_from_file(name: str, txt: str, max_chars: int = 18000,
 
 SINGLE_FILE_TENDER_PROMPT = """أنت مهندس مكتب فني أول وخبير تحليل وثائق مناقصات.
 
-مهمتك الآن تحليل ملف واحد فقط من ملفات المناقصة، وليس إصدار التقرير النهائي.
-استخرج الحقائق القابلة للاستخدام لاحقاً في التقرير النهائي، مع المحافظة على اسم الملف كمصدر.
+مهمتك الآن تحليل ملف واحد فقط من ملفات المناقصة لصالح مقدم العرض: شركة الرواف.
+استخرج كل الحقائق والمتطلبات القابلة للاستخدام في تقرير العرض الفني النهائي.
 
-أعد مخرجاً مركزاً ومنظماً، ولا يتجاوز 900 كلمة، بالهيكل التالي:
+أعد مخرجاً مركزاً ومنظماً، ولا يتجاوز 1100 كلمة، بالهيكل التالي:
 # مصدر الملف
 # معلومات المشروع المذكورة
 # نطاق الأعمال
+# متطلبات الجهة المالكة من مقدم العرض
 # المتطلبات الفنية والرقمية
+# المنهجيات والخطط المطلوبة
+# الكوادر والموارد والمعدات
+# الجودة والسلامة والبيئة
 # المدد والمواعيد والضمانات
 # الشروط التعاقدية والمالية المهمة
-# متطلبات التقديم والامتثال
-# المخاطر والفجوات
+# المخاطر والفجوات والاستفسارات
 # معلومات غير متوفرة داخل هذا الملف
 
 لا تخترع أي معلومة. إذا لم تظهر المعلومة في الملف، اكتب: غير متوفرة في هذا الملف."""
 
-
 TENDER_SYNTHESIS_PROMPT = """أنت مهندس مكتب فني أول وخبير عطاءات دولية متخصص في مشاريع البنية التحتية والتشييد.
 
-مهمتك دمج ملخصات تحليل ملفات المناقصة في تقرير استخلاصي نهائي.
+مهمتك دمج ملخصات تحليل ملفات المناقصة في تقرير استخلاصي نهائي لصالح مقدم العرض: شركة الرواف.
 اعتمد فقط على الملخصات المزودة لك، ولا تخترع أي معلومة.
 عند غياب المعلومة اكتب: غير محددة في الوثائق المرفوعة.
 
+المطلوب تقرير غزير ودقيق يركز على جميع متطلبات الجهة المالكة من مقدم العرض، وليس مجرد ملخص وصفي.
+
 هيكل التقرير المطلوب:
-# 📋 ملخص تنفيذي
-# 1. نطاق العمل والأعمال المطلوبة
-# 2. مدة المشروع والمراحل الزمنية
-# 3. المتطلبات الفنية والكودية
-# 4. جداول الكميات والأرقام والكميات المهمة
-# 5. الشروط التعاقدية والمخاطر
-# 6. متطلبات التقديم والامتثال
-# 7. الفجوات والمعلومات غير المتوفرة
-# 8. توصيات فنية لفريق العروض
+# 📋 الملخص التنفيذي للمنافسة
+# 1. بطاقة حقائق المشروع
+# 2. نطاق العمل المستخلص
+# 3. مصفوفة متطلبات الجهة المالكة من مقدم العرض
+# 4. المتطلبات الفنية والكودية
+# 5. المنهجيات والخطط المطلوبة في العرض الفني
+# 6. الموارد والكوادر والمعدات المطلوبة
+# 7. متطلبات الجودة والسلامة والبيئة
+# 8. البرنامج الزمني والمواعيد والالتزامات الزمنية
+# 9. جدول الكميات والأرقام المؤثرة
+# 10. الشروط التعاقدية المؤثرة على العرض الفني
+# 11. الفجوات والتعارضات ونقاط الاستفسار
+# 12. توصيات إعداد العرض الفني لشركة الرواف
 
 اذكر مصدر كل معلومة قدر الإمكان باسم الملف كما ورد في الملخصات."""
 
 
 def analyze_tender_in_batches(client, tender_texts: dict) -> str:
     """
-    تحليل مناقصة كبيرة بطريقة Map-Reduce:
-    1) تحليل كل ملف منفرداً ضمن حد آمن.
-    2) ضغط مخرجات الملفات.
-    3) إصدار تقرير نهائي من الملخصات فقط.
-    هذا يمنع خطأ Request too large حتى مع النماذج ذات السياق الكبير.
+    Production tender analysis engine.
+
+    Default behavior:
+    - Use ONE focused comprehensive analysis pass when the uploaded tender context
+      fits the configured token budget.
+
+    Safety behavior:
+    - If the tender set is too large for a reliable single request, switch to staged
+      extraction per file, then synthesize. This is not the default path; it is a
+      protection mechanism to avoid missing owner requirements or crashing with
+      Request too large / Tokens per minute errors.
     """
     if not tender_texts:
         return "[AI Error: لا توجد ملفات لتحليلها.]"
 
-    per_file_summaries = []
-    total = len(tender_texts)
+    model = st.session_state.get("openai_model", DEFAULT_MODEL)
+    raw_total_tokens = sum(count_tokens(txt or "", model=model) for txt in tender_texts.values())
 
-    for i, (name, txt) in enumerate(tender_texts.items(), start=1):
-        file_context = build_compact_context_from_file(name, txt, max_chars=18000)
-        file_prompt = (
-            f"حلل الملف رقم {i} من {total}.\n"
-            f"اسم الملف: {name}\n"
-            f"عدد الكلمات التقريبي: {word_count(txt):,}\n\n"
-            f"النص المحدود الآمن للتحليل:\n{file_context}"
+    def _single_pass() -> str:
+        # Build a compact but source-labeled context. The budget is intentionally firm:
+        # a focused one-pass report is preferred, but not at the cost of API failure.
+        per_file_budget = max(
+            3_000,
+            min(MAX_INPUT_TOKENS_PER_FILE, int(MAX_SINGLE_PASS_TENDER_TOKENS / max(len(tender_texts), 1))),
         )
-        summary = call_ai(
+        tender_context = build_context_bundle(
+            tender_texts,
+            label="Tender File",
+            max_total_tokens=MAX_SINGLE_PASS_TENDER_TOKENS,
+            per_file_tokens=per_file_budget,
+            model=model,
+        )
+        user_msg = (
+            "أنت الآن تحلل وثائق مناقصة لصالح مقدم العرض: شركة الرواف.\n"
+            "أصدر تقريراً واحداً مركزاً وغزيراً ودقيقاً، مع استخراج كل ما تطلبه الجهة المالكة من مقدم العرض فنياً وإدارياً وتقديمياً.\n"
+            "لا تفترض أي معلومة غير ظاهرة في النصوص. اربط كل متطلب باسم الملف قدر الإمكان.\n\n"
+            "النصوص المرفوعة ضمن ميزانية آمنة للتحليل:\n\n"
+            f"{tender_context}"
+        )
+        return call_ai(
             client,
-            SINGLE_FILE_TENDER_PROMPT,
-            file_prompt,
-            max_tokens=3000,
+            TENDER_ANALYSIS_PROMPT,
+            user_msg,
+            max_tokens=7_500,
+            temperature=0.08,
+        )
+
+    def _staged_pass() -> str:
+        per_file_summaries = []
+        total = len(tender_texts)
+
+        for i, (name, txt) in enumerate(tender_texts.items(), start=1):
+            file_context = build_compact_context_from_file(
+                name,
+                txt,
+                max_chars=18000,
+                max_tokens=MAX_INPUT_TOKENS_PER_FILE,
+            )
+            file_prompt = (
+                f"حلل الملف رقم {i} من {total} لصالح مقدم العرض: شركة الرواف.\n"
+                f"اسم الملف: {name}\n"
+                f"عدد الكلمات التقريبي: {word_count(txt):,}\n\n"
+                "استخرج كل طلب فني أو إداري أو تقديمي تفرضه الجهة المالكة على مقدم العرض، "
+                "مع تمييز المتطلبات الحرجة ومتطلبات المنهجيات والموارد والجودة والسلامة والبرنامج الزمني والوثائق.\n\n"
+                f"النص المحدود الآمن للتحليل:\n{file_context}"
+            )
+            summary = call_ai(
+                client,
+                SINGLE_FILE_TENDER_PROMPT,
+                file_prompt,
+                max_tokens=3_200,
+                temperature=0.08,
+            )
+            if summary.startswith("[AI Error"):
+                per_file_summaries.append(f"# {name}\nتعذر تحليل هذا الملف: {summary}")
+            else:
+                per_file_summaries.append(f"# {name}\n{truncate_to_token_budget(summary, 2_200, model=model)}")
+
+            # Production-grade throttle to reduce TPM/RPM pressure on dense tender sets.
+            time.sleep(TENDER_ANALYSIS_SLEEP_SECONDS)
+
+        merged_summaries = "\n\n".join(per_file_summaries)
+        final_input = (
+            "فيما يلي ملخصات تحليل الملفات منفردة. استخدمها لإصدار تقرير نهائي واحد لصالح شركة الرواف.\n"
+            "المطلوب تقرير غزير ودقيق يحتوي على جميع متطلبات الجهة المالكة من مقدم العرض، "
+            "خصوصاً المتطلبات الفنية، منهجيات التنفيذ، الكوادر، المعدات، الجودة، السلامة، البرنامج الزمني، "
+            "الوثائق المطلوبة، متطلبات الامتثال، المخاطر، والفجوات.\n"
+            "اعتمد فقط على الملخصات المزودة، واذكر اسم الملف كمصدر قدر الإمكان.\n\n"
+            + truncate_to_token_budget(merged_summaries, MAX_SYNTHESIS_INPUT_TOKENS, model=model)
+        )
+        return call_ai(
+            client,
+            TENDER_SYNTHESIS_PROMPT,
+            final_input,
+            max_tokens=7_500,
             temperature=0.1,
         )
-        if summary.startswith("[AI Error"):
-            per_file_summaries.append(f"# {name}\nتعذر تحليل هذا الملف: {summary}")
-        else:
-            per_file_summaries.append(f"# {name}\n{truncate_to_token_budget(summary, 1800)}")
 
-        # تهدئة بسيطة لتقليل ضغط rate limit على الحسابات الصغيرة
-        time.sleep(0.8)
+    # Prefer one focused pass when technically safe.
+    if raw_total_tokens <= MAX_SINGLE_PASS_TENDER_TOKENS:
+        result = _single_pass()
+        if not is_request_too_large_error(result):
+            return result
+        log.warning("Single-pass tender analysis exceeded request limits; switching to staged safety mode.")
 
-    merged_summaries = "\n\n".join(per_file_summaries)
-
-    final_input = (
-        "فيما يلي ملخصات تحليل الملفات منفردة. "
-        "استخدمها لإصدار التقرير النهائي دون الرجوع للنصوص الخام ودون افتراضات.\n\n"
-        + truncate_to_token_budget(merged_summaries, MAX_SYNTHESIS_INPUT_TOKENS)
-    )
-
-    return call_ai(
-        client,
-        TENDER_SYNTHESIS_PROMPT,
-        final_input,
-        max_tokens=6000,
-        temperature=0.15,
-    )
+    # Staged mode is only used when the complete tender set is too large or the API rejects one-pass.
+    return _staged_pass()
 
 
 
@@ -1632,19 +1717,23 @@ def compare_tender_snapshots(selected: list[dict]) -> dict:
 def generate_plan_docx(plan_type: str, plan_content: str, project_name: str,
                        structure: list, template_bytes: bytes | None = None) -> bytes:
     """
-    Generate a Word document safely.
+    Generate a Word document safely for production.
 
-    Hardened behavior:
-    - Uses docxtpl when the uploaded template contains Jinja placeholders.
-    - Avoids direct XML manipulation such as paragraph._p.remove(...).
-    - If the template has no placeholders, the generated content is appended
-      safely with python-docx while preserving the original template file.
+    Production behavior:
+    - docxtpl is used only for short metadata placeholders.
+    - Long AI-generated Markdown content is NOT injected into {{ content }} as raw text.
+    - The long content is appended as real Word headings, paragraphs and lists using
+      python-docx, so the output remains readable and professionally formatted.
+    - No direct XML deletion/manipulation is used.
 
-    Supported placeholders inside DOCX templates:
-      {{ project_name }}, {{ plan_type }}, {{ content }}, {{ generated_at }},
-      {{ outline }}, {{ sections }}, {{ structure }}
+    Recommended metadata placeholders inside DOCX templates:
+      {{ project_name }}, {{ plan_type }}, {{ generated_at }}, {{ outline }}
+
+    If the template contains {{ content }}, it will be intentionally cleared and the
+    formatted content will be appended safely at the end of the template.
     """
     from docx import Document
+    from docx.shared import Pt
 
     def _parse_sections(text: str) -> list[dict]:
         out: list[dict] = []
@@ -1679,41 +1768,72 @@ def generate_plan_docx(plan_type: str, plan_content: str, project_name: str,
                     texts.extend(p.text for p in cell.paragraphs)
         return any(any(m in t for m in markers) for t in texts)
 
+    def _add_markdown_line(doc: Document, line: str) -> None:
+        stripped = (line or "").strip()
+        if not stripped:
+            doc.add_paragraph("")
+            return
+        if stripped.startswith("### "):
+            doc.add_heading(stripped.replace("### ", "", 1).strip(), level=3)
+            return
+        if stripped.startswith("## "):
+            doc.add_heading(stripped.replace("## ", "", 1).strip(), level=2)
+            return
+        if stripped.startswith("# "):
+            doc.add_heading(stripped.replace("# ", "", 1).strip(), level=1)
+            return
+        if stripped.startswith(("- ", "• ")):
+            doc.add_paragraph(stripped[2:].strip(), style="List Bullet")
+            return
+        if re.match(r"^\d+[\.)]\s+", stripped):
+            doc.add_paragraph(re.sub(r"^\d+[\.)]\s+", "", stripped), style="List Number")
+            return
+
+        # Basic bold support for lines containing **text** while preserving simplicity.
+        p = doc.add_paragraph()
+        parts = re.split(r"(\*\*[^*]+\*\*)", stripped)
+        for part in parts:
+            if part.startswith("**") and part.endswith("**") and len(part) > 4:
+                r = p.add_run(part[2:-2])
+                r.bold = True
+            else:
+                p.add_run(part)
+
     def _append_generated_content(doc: Document, content: str) -> None:
         if len(doc.paragraphs) > 0 or len(doc.tables) > 0:
             doc.add_page_break()
-        doc.add_heading(plan_type or "Generated Plan", level=1)
+        title = plan_type or "Generated Plan"
+        doc.add_heading(title, level=1)
         if project_name:
             p = doc.add_paragraph()
             p.add_run("Project: ").bold = True
             p.add_run(project_name)
-        doc.add_paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        p = doc.add_paragraph()
+        p.add_run("Generated: ").bold = True
+        p.add_run(datetime.now().strftime("%Y-%m-%d %H:%M"))
         doc.add_paragraph("")
 
         for line in (content or "").splitlines():
-            stripped = line.strip()
-            if not stripped:
-                doc.add_paragraph("")
-                continue
-            if stripped.startswith("## "):
-                doc.add_heading(stripped.replace("## ", "", 1).strip(), level=2)
-            elif stripped.startswith("# "):
-                doc.add_heading(stripped.replace("# ", "", 1).strip(), level=1)
-            elif stripped.startswith(("- ", "• ")):
-                doc.add_paragraph(stripped[2:].strip(), style="List Bullet")
-            elif re.match(r"^\d+[\.)]\s+", stripped):
-                doc.add_paragraph(re.sub(r"^\d+[\.)]\s+", "", stripped), style="List Number")
-            else:
-                doc.add_paragraph(stripped)
+            _add_markdown_line(doc, line)
+
+        # Apply a readable default font size to generated paragraphs only where possible.
+        try:
+            for para in doc.paragraphs:
+                for run in para.runs:
+                    if run.font.size is None:
+                        run.font.size = Pt(10)
+        except Exception:
+            pass
 
     sections = _parse_sections(plan_content)
-    context = {
+    metadata_context = {
         "project_name": project_name or "",
         "plan_type": plan_type or "",
-        "content": plan_content or "",
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
         "outline": _outline_from_structure(structure),
-        "sections": sections,
+        # Intentionally blank to avoid raw Markdown injection through docxtpl.
+        "content": "",
+        "sections": [],
         "structure": structure or [],
     }
 
@@ -1725,12 +1845,15 @@ def generate_plan_docx(plan_type: str, plan_content: str, project_name: str,
             try:
                 from docxtpl import DocxTemplate
                 tpl = DocxTemplate(io.BytesIO(template_bytes))
-                tpl.render(context)
-                buf = io.BytesIO()
-                tpl.save(buf)
-                return buf.getvalue()
+                tpl.render(metadata_context)
+                rendered = io.BytesIO()
+                tpl.save(rendered)
+                rendered.seek(0)
+                doc = Document(rendered)
+                _append_generated_content(doc, plan_content)
+                buf = io.BytesIO(); doc.save(buf); return buf.getvalue()
             except Exception as e:
-                log.warning(f"docxtpl render failed, falling back to safe append: {e}")
+                log.warning(f"docxtpl metadata render failed, falling back to safe append: {e}")
                 doc = Document(io.BytesIO(template_bytes))
                 _append_generated_content(doc, plan_content)
                 buf = io.BytesIO(); doc.save(buf); return buf.getvalue()
@@ -1965,31 +2088,73 @@ def generate_gonogo_pdf(verdict_data: dict, dashboard_data: dict, project_name: 
 # ─────────────────────────────────────────────────────────────────────────────
 # AI PROMPTS — UNCHANGED (Arabic + English)
 # ─────────────────────────────────────────────────────────────────────────────
-TENDER_ANALYSIS_PROMPT = """أنت مهندس مكتب فني أول وخبير عطاءات دولية متخصص في مشاريع البنية التحتية والتشييد.
+TENDER_ANALYSIS_PROMPT = """أنت مهندس فني أول لإعداد العروض الفنية وخبير تحليل وثائق مناقصات في قطاع المقاولات.
 
-مهمتك: تحليل وثائق المناقصة المرفوعة وإنتاج تقرير استخلاصي شامل ودقيق.
+السياق: مقدم العرض هو شركة الرواف. مطلوب تحليل وثائق الجهة المالكة لاستخراج كل ما يجب على شركة الرواف الالتزام به في العرض الفني والتقديم.
 
-التعليمات الصارمة:
-1. ابحث في كل "جداول الكميات" (BOQ) واستخرج الأرقام المحددة — لا تتجاهل أي جدول.
-2. استخرج كل الأرقام والنسب المئوية والمدد الزمنية والمبالغ بشكل حرفي.
-3. ربط المعلومات المتفرقة: إذا ذُكر نوع مادة في ملف والكمية في ملف آخر، ادمجهما.
-4. لبنود الفيديك: اذكر رقم البند (مثل: Sub-Clause 8.7) مع القيمة المستخرجة.
-5. إذا لم تجد المعلومة بعد مسح كامل للملفات، اكتب: "غير محددة في الوثائق المرفوعة".
+مهمتك: إصدار تقرير تحليل مناقصة واحد، غزير، دقيق، عملي، وقابل للاستخدام مباشرة من فريق العروض الفنية.
 
-هيكل التقرير المطلوب (اتبعه حرفياً):
+قواعد صارمة:
+1. اعتمد فقط على النصوص المرفوعة داخل الطلب. لا تفترض أي نطاق أو شرط أو مدة أو مورد غير ظاهر.
+2. لكل معلومة مهمة اذكر مصدرها باسم الملف كما يظهر في السياق، قدر الإمكان.
+3. استخرج كل متطلب تطلبه الجهة المالكة من مقدم العرض، وليس فقط وصف المشروع.
+4. استخرج جميع الأرقام والنسب والمدد والكميات والمواعيد والغرامات والضمانات وشروط التقديم كما وردت.
+5. افصل بين: متطلبات فنية، متطلبات تقديم، متطلبات منهجيات، متطلبات موارد، متطلبات جودة، متطلبات سلامة، متطلبات برنامج زمني، ومتطلبات مستندات.
+6. إذا لم تظهر المعلومة في الوثائق، اكتب: غير محددة في الوثائق المرفوعة.
+7. لا تستخدم لغة عامة مثل "حسب المواصفات" فقط؛ اذكر نص/مضمون المتطلب المحدد إن ظهر.
+8. إذا وجدت بنداً بكمية صفر في جدول الكميات، اذكره في قسم مستقل بعنوان [بنود كمية صفر تحتاج تحقق] ولا تدرجه ضمن النطاق التنفيذي المعتمد.
 
-# 📋 ملخص تنفيذي
-[سطرين عن طبيعة المشروع وحجمه]
+هيكل التقرير المطلوب:
 
-# 1. نطاق العمل والأعمال المطلوبة
-# 2. مدة المشروع والمراحل الزمنية
-# 3. شروط الدفع وبنود الفيديك
-# 4. الغرامات وتعويضات التأخير
-# 5. بيانات الأسعار وجدول الكميات (BOQ)
-# 6. قائمة بيانات المنهجية (Method Statements) المطلوبة
-# 7. المتطلبات التأهيلية والوثائق المصاحبة
-# 8. نقاط المخاطر الهندسية والقانونية
-# 9. توصيات فريق العطاءات"""
+# 📋 الملخص التنفيذي للمنافسة
+- طبيعة المشروع كما تظهر في الوثائق.
+- درجة وضوح الوثائق.
+- أهم متطلبات الجهة المالكة من مقدم العرض.
+- أهم مخاطر أو فجوات تؤثر على قرار التقديم.
+
+# 1. بطاقة حقائق المشروع
+جدول يحتوي على: اسم المشروع، الجهة المالكة، موقع الأعمال، مدة المشروع، نطاق العمل، نوع العقد/الاتفاقية، موعد التقديم، مصادر كل معلومة.
+
+# 2. نطاق العمل المستخلص
+اعرض نطاق الأعمال والحزم التنفيذية كما تظهر في الوثائق، مع عدم إضافة أعمال غير مذكورة.
+
+# 3. مصفوفة متطلبات الجهة المالكة من مقدم العرض
+جدول إلزامي بالأعمدة التالية:
+- رقم
+- المتطلب المطلوب من مقدم العرض
+- التصنيف: فني / إداري / تقديم / جودة / سلامة / زمني / موارد / وثائق / مالي-تعاقدي
+- درجة الأهمية: حرج / رئيسي / داعم
+- المصدر: اسم الملف أو البند إن توفر
+- أثره على العرض الفني
+- الإجراء المطلوب من شركة الرواف
+
+# 4. المتطلبات الفنية والكودية
+استخرج المواصفات الفنية، الأكواد، المعايير، المواد، الاختبارات، حدود القبول، ومتطلبات التنفيذ الواضحة.
+
+# 5. المنهجيات والخطط المطلوبة في العرض الفني
+اذكر كل منهجية أو خطة أو بيان طريقة تنفيذ تطلبه الوثائق صراحة أو يلزم لإثبات الامتثال الفني، مع مصدر كل مطلب.
+
+# 6. الموارد والكوادر والمعدات المطلوبة
+استخرج أي متطلبات للهيكل التنظيمي، الخبرات، المؤهلات، العمالة، المعدات، أو المقاولين/الموردين.
+
+# 7. متطلبات الجودة والسلامة والبيئة
+استخرج متطلبات ضبط الجودة، الفحوصات، السلامة، الصحة المهنية، البيئة، التصاريح، وخطط الموقع.
+
+# 8. البرنامج الزمني والمواعيد والالتزامات الزمنية
+استخرج مدة المشروع، تواريخ التقديم، الاستفسارات، الزيارات، الإنجاز، الضمانات، والقيود الزمنية.
+
+# 9. جدول الكميات والأرقام المؤثرة
+استخرج البنود والكميات والأرقام الحرجة التي تؤثر على النطاق الفني، مع تمييز أي بنود كمية صفر إن وجدت.
+
+# 10. الشروط التعاقدية المؤثرة على العرض الفني
+استخرج شروط الدفع، الغرامات، الضمانات، التأمينات، الفيديك أو الشروط الخاصة، وأثرها على التجهيز الفني.
+
+# 11. الفجوات والتعارضات ونقاط الاستفسار
+جدول بالأعمدة: رقم، الفجوة/التعارض/السؤال، سبب الأهمية، المصدر، الإجراء المقترح.
+
+# 12. توصيات إعداد العرض الفني لشركة الرواف
+اكتب توصيات عملية مباشرة للفريق: ماذا يجب تضمينه، ماذا يجب التحقق منه، وما الأولويات قبل التقديم.
+"""
 
 PROPOSAL_REVIEW_PROMPT = """أنت خبير تقييم عروض فنية دولي متخصص في مراجعة مطابقة العروض مع متطلبات الجهات المالكة.
 
