@@ -1,12 +1,42 @@
-streamlit==1.39.0
-openai==1.66.3
-httpx==0.27.2
-pdfplumber==0.11.4
-pandas==2.2.3
-python-docx==1.1.2
-xlsxwriter==3.2.0
-reportlab==4.2.5
-tiktoken>=0.7.0
-arabic-reshaper==3.0.0
-python-bidi==0.6.3
-docxtpl==0.16.8
+# ═════════════════════════════════════════════════════════════════════════════
+# TenderLens Pro v4.0 — Production Requirements
+# Verified against actual code imports.
+# Target: Python 3.11 (recommended) | 3.10+ compatible | 3.12 OK.
+# ═════════════════════════════════════════════════════════════════════════════
+
+# ── 1. Core Web Framework ────────────────────────────────────────────────────
+streamlit>=1.32.0,<2.0.0
+
+# ── 2. OpenAI SDK (Responses API + Chat Completions) ─────────────────────────
+# IMPORTANT: openai >=1.50 required for gpt-5.x Responses API with reasoning effort.
+openai>=1.50.0,<2.0.0
+httpx>=0.27.0,<1.0.0
+
+# ── 3. Token Counting ────────────────────────────────────────────────────────
+tiktoken>=0.7.0,<1.0.0
+
+# ── 4. PDF Reading ───────────────────────────────────────────────────────────
+pdfplumber>=0.11.0,<1.0.0
+
+# ── 5. OCR Layer (REQUIRED for scanned Etimad PDFs) ──────────────────────────
+# System dependency:
+#   sudo apt-get install -y tesseract-ocr tesseract-ocr-ara poppler-utils
+pytesseract>=0.3.10,<1.0.0
+pdf2image>=1.17.0,<2.0.0
+Pillow>=10.0.0,<12.0.0
+
+# ── 6. Word Document I/O ─────────────────────────────────────────────────────
+python-docx>=1.1.0,<2.0.0
+docxtpl>=0.16.7,<1.0.0
+
+# ── 7. PDF Generation with Arabic Shaping ────────────────────────────────────
+reportlab>=4.0.0,<5.0.0
+arabic-reshaper>=3.0.0,<4.0.0
+python-bidi>=0.4.2,<1.0.0
+
+# ── 8. Excel I/O ─────────────────────────────────────────────────────────────
+pandas>=2.0.0,<3.0.0
+xlsxwriter>=3.1.0,<4.0.0
+
+# ── 9. Hijri Calendar (REQUIRED for KSA government dates) ────────────────────
+hijri-converter>=2.3.0,<3.0.0
