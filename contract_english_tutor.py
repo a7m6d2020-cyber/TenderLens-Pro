@@ -366,6 +366,7 @@ with st.sidebar:
             "🔊 النطق واللهجة",
             "📖 معمل القراءة",
             "💬 المحادثات",
+            "✍️ الإملاء السمعي",
             "📝 الاختبارات",
             "🔎 المعجم",
             "📈 تقدّمي",
@@ -660,6 +661,76 @@ elif page == "💬 المحادثات":
                 gc2.markdown(meaning)
         if d.get("notes_ar"):
             st.success("🗒️ " + d["notes_ar"])
+
+# ── ✍️ الإملاء السمعي ────────────────────────────────────────────────────────
+elif page == "✍️ الإملاء السمعي":
+    import difflib
+    import re as _re
+
+    st.header("✍️ الإملاء السمعي — درّب أذنك")
+    st.caption("استمع إلى الجملة (بلا نص)، اكتب ما سمعته، ثم تحقّق. أقوى تمرين لربط الصوت بالكلمة المكتوبة.")
+
+    def _norm(s: str) -> list[str]:
+        s = s.lower().replace("-", " ")
+        s = _re.sub(r"[^a-z0-9\s]", " ", s)
+        return s.split()
+
+    levels = ["الكل"] + sorted({d["level"] for d in data.DICTATION}, key=lambda x: ["سهل", "متوسط", "صعب"].index(x))
+    lvl = st.selectbox("المستوى:", levels)
+    pool = [d for d in data.DICTATION if lvl == "الكل" or d["level"] == lvl]
+
+    if "dict_item" not in st.session_state or st.session_state.get("dict_lvl") != lvl:
+        st.session_state.dict_item = random.choice(pool)
+        st.session_state.dict_lvl = lvl
+    if st.button("🎲 عبارة جديدة"):
+        st.session_state.dict_item = random.choice(pool)
+        st.session_state.pop("dict_answer", None)
+
+    item = st.session_state.dict_item
+    st.markdown(f"<span class='pill-gold'>{item['level']}</span>", unsafe_allow_html=True)
+    st.markdown("**1) استمع (يمكنك الإبطاء والتكرار):**")
+    speak_widget(item["text"], key=f"dict_{abs(hash(item['text']))%99999}", show_shadow=False)
+
+    answer = st.text_input("2) اكتب ما سمعته بالإنجليزية:", key="dict_answer", placeholder="type what you hear...")
+    cda, cdb = st.columns(2)
+    check = cda.button("تحقّق ✅", type="primary")
+    reveal = cdb.button("👁️ اكشف النص")
+
+    if check and answer.strip():
+        target_words = _norm(item["text"])
+        user_words = _norm(answer)
+        sm = difflib.SequenceMatcher(a=user_words, b=target_words)
+        # أعد بناء النص الهدف مع تلوين الكلمات الصحيحة/المفقودة
+        rendered = []
+        correct = 0
+        for tag, i1, i2, j1, j2 in sm.get_opcodes():
+            if tag == "equal":
+                for w in target_words[j1:j2]:
+                    rendered.append(f'<span style="color:#1a8a3a;font-weight:600">{w}</span>')
+                correct += (j2 - j1)
+            elif tag in ("replace", "delete", "insert"):
+                for w in target_words[j1:j2]:
+                    rendered.append(f'<span style="color:#c0392b;text-decoration:underline">{w}</span>')
+        pct = int(correct / max(1, len(target_words)) * 100)
+        st.markdown(f"### دقّتك: {pct}%  ({correct}/{len(target_words)} كلمة)")
+        st.markdown(
+            '<div class="reading-en">' + " ".join(rendered) + "</div>",
+            unsafe_allow_html=True,
+        )
+        st.caption("🟢 أخضر = أصبتها · 🔴 أحمر = فاتتك أو أخطأتها")
+        st.markdown(f"**الترجمة:** {item['ar']}")
+        add_xp(max(1, pct // 20))
+        P["quiz_history"].append({"date": _today(), "type": "dictation", "score": correct, "total": len(target_words)})
+        save_progress()
+        if pct == 100:
+            st.success("مطابقة تامة! 🎯")
+            st.balloons()
+    elif check:
+        st.warning("اكتب ما سمعته أولاً.")
+
+    if reveal:
+        st.info(f"**النص:** {item['text']}")
+        st.markdown(f"**الترجمة:** {item['ar']}")
 
 # ── 📝 الاختبارات ────────────────────────────────────────────────────────────
 elif page == "📝 الاختبارات":
