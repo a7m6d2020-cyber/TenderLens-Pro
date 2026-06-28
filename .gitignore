@@ -1,0 +1,9 @@
+# ملف تقدّم المتعلّم (يُنشأ وقت التشغيل)
+.tutor_progress.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.streamlit/secrets.toml
